@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+runs/
+cache_16k/
+lm_corpus.txt
+lm.arpa
+lm.bin
+*.ckpt
+submission*.csv
+asr-2026-spoken-numbers-recognition-challenge.zip
+asr-2026-spoken-numbers-recognition-challenge/
+noise_corpus/
+rir_corpus/
