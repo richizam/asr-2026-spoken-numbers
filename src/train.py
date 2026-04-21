@@ -91,6 +91,8 @@ def validate(
     model.eval()
     per_spk_errs: dict[str, list[float]] = {}
     all_errs: list[float] = []
+    empty_preds = 0
+    pred_1000 = 0
     for batch in tqdm(loader, desc="val", leave=False):
         wav = batch["wav"].to(device)
         wav_lens = batch["wav_lens"].to(device)
@@ -98,10 +100,15 @@ def validate(
         log_probs = log_probs.transpose(0, 1)       # (B, T, V)
         for b in range(log_probs.size(0)):
             lp = log_probs[b, : int(out_lens[b].item())]
-            hyp_int = decoder.decode_to_int(lp.cpu(), method=method)
+            raw_text = decoder.decode_text(lp.cpu(), method=method)
+            hyp_int = decoder.snap.decode_to_int(raw_text)
             ref_int = batch["target_ints"][b]
             err = int_cer(ref_int, hyp_int)
             all_errs.append(err)
+            if not raw_text.strip():
+                empty_preds += 1
+            if hyp_int == 1000:
+                pred_1000 += 1
             spk = batch["spk_ids"][b] or "unknown"
             per_spk_errs.setdefault(spk, []).append(err)
     mean_cer = float(np.mean(all_errs)) if all_errs else 1.0
@@ -113,7 +120,14 @@ def validate(
     else:
         hmean = 1.0
     model.train()
-    return {"cer": mean_cer, "per_spk": per_spk, "hmean_cer": 1.0 / hmean if hmean else 1.0}
+    n = max(1, len(all_errs))
+    return {
+        "cer": mean_cer,
+        "per_spk": per_spk,
+        "hmean_cer": hmean,
+        "empty_pred_rate": empty_preds / n,
+        "pred_1000_rate": pred_1000 / n,
+    }
 
 
 def save_ckpt(path: Path, **state: Any) -> None:
@@ -199,7 +213,9 @@ def train(config_path: str) -> None:
 
     start_epoch = 0
     global_step = 0
+    best_metric = float("inf")
     best_cer = float("inf")
+    val_method = cfg["decode"].get("method", "beam_lm")
 
     last_ckpt = out_dir / "last.ckpt"
     if last_ckpt.exists():
@@ -210,11 +226,15 @@ def train(config_path: str) -> None:
         scaler.load_state_dict(state["scaler"])
         start_epoch = state["epoch"] + 1
         global_step = state["step"]
+        best_metric = state.get("best_metric", state.get("best_hmean_cer", state.get("best_cer", float("inf"))))
         best_cer = state.get("best_cer", float("inf"))
         torch.set_rng_state(state["rng_cpu"])
         if torch.cuda.is_available() and state.get("rng_cuda") is not None:
             torch.cuda.set_rng_state_all(state["rng_cuda"])
-        print(f"[resume] epoch {start_epoch}, step {global_step}, best_cer {best_cer:.4f}")
+        print(
+            f"[resume] epoch {start_epoch}, step {global_step}, "
+            f"best_metric {best_metric:.4f}, best_cer {best_cer:.4f}"
+        )
 
     ctc = torch.nn.CTCLoss(blank=vocab.blank_id, zero_infinity=True)
 
@@ -272,14 +292,30 @@ def train(config_path: str) -> None:
 
         # Validate
         if (epoch + 1) % cfg["train"]["val_every"] == 0:
-            metrics = validate(model, dev_loader, decoder, device, method="greedy")
-            print(f"[epoch {epoch}] dev CER = {metrics['cer']:.4f}  per_spk = {metrics['per_spk']}")
-            cur = metrics["cer"]
-            if cur < best_cer:
-                best_cer = cur
-                save_ckpt(out_dir / "best.ckpt",
-                          model=model.state_dict(), cer=cur, epoch=epoch, cfg=cfg)
-                print(f"[epoch {epoch}] new best dev CER: {cur:.4f} -> saved best.ckpt")
+            metrics = validate(model, dev_loader, decoder, device, method=val_method)
+            print(
+                f"[epoch {epoch}] dev CER = {metrics['cer']:.4f}  "
+                f"hmean CER = {metrics['hmean_cer']:.4f}  "
+                f"empty = {metrics['empty_pred_rate']:.1%}  "
+                f"pred1000 = {metrics['pred_1000_rate']:.1%}  "
+                f"per_spk = {metrics['per_spk']}"
+            )
+            cur = metrics["hmean_cer"]
+            if cur < best_metric:
+                best_metric = cur
+                best_cer = metrics["cer"]
+                save_ckpt(
+                    out_dir / "best.ckpt",
+                    model=model.state_dict(),
+                    cer=metrics["cer"],
+                    hmean_cer=metrics["hmean_cer"],
+                    epoch=epoch,
+                    cfg=cfg,
+                )
+                print(
+                    f"[epoch {epoch}] new best dev hmean CER: {cur:.4f} "
+                    f"(mean CER {metrics['cer']:.4f}) -> saved best.ckpt"
+                )
 
         save_ckpt(
             last_ckpt,
@@ -289,6 +325,7 @@ def train(config_path: str) -> None:
             scaler=scaler.state_dict(),
             epoch=epoch,
             step=global_step,
+            best_metric=best_metric,
             best_cer=best_cer,
             rng_cpu=torch.get_rng_state(),
             rng_cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,

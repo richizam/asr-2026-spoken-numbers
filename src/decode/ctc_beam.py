@@ -175,7 +175,7 @@ class CTCBeamDecoder:
     # High-level wrapper: log-probs -> final integer
     # ------------------------------------------------------------------
 
-    def decode_to_int(self, log_probs: torch.Tensor, method: str = "beam_lm") -> int:
+    def decode_text(self, log_probs: torch.Tensor, method: str = "beam_lm") -> str:
         log_probs = log_probs / self.temperature
         if method == "greedy":
             text = self.greedy_decode(log_probs)
@@ -188,6 +188,10 @@ class CTCBeamDecoder:
             text = self.lm_rescore(beams)  # type: ignore[arg-type]
         else:
             raise ValueError(f"unknown method: {method}")
+        return text
+
+    def decode_to_int(self, log_probs: torch.Tensor, method: str = "beam_lm") -> int:
+        text = self.decode_text(log_probs, method=method)
         return self.snap.decode_to_int(text)
 
 
