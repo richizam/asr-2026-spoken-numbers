@@ -31,7 +31,21 @@ from .text.denormalizer import TrieSnapper
 def load_model(ckpt_path: Path, cfg: dict, device: torch.device) -> ConformerCTC:
     model = ConformerCTC(ConformerCTCConfig(**cfg["model"])).to(device)
     state = torch.load(ckpt_path, map_location=device)
-    sd = state["model"] if "model" in state else state
+    # Prefer EMA weights when they exist — they generalize better on OOD
+    # speakers, which is the leaderboard tie-breaker. best.ckpt stores the
+    # shadow under "model_ema"; last.ckpt stores it under "ema" (same content,
+    # different key because the training loop uses one schema for resumable
+    # state and another for inference-ready state). Check both.
+    if isinstance(state, dict):
+        for key in ("model_ema", "ema"):
+            if state.get(key) is not None:
+                model.load_state_dict(state[key])
+                model.eval()
+                print(f"[infer] loaded EMA weights (key={key}) from {ckpt_path}")
+                return model
+        sd = state["model"] if "model" in state else state
+    else:
+        sd = state
     model.load_state_dict(sd)
     model.eval()
     return model

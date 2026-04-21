@@ -40,6 +40,9 @@ train:
     freq_mask_param: 15
     num_time_masks: 2
     time_mask_param: 35
+  ema:
+    enabled: true
+    decay: 0.999               # shadow weights used for val + infer
 
 decode:
   beam_width: 16

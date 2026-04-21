@@ -150,9 +150,9 @@ class ConformerCTC(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.frontend = LogMelFilterBanks(samplerate=cfg.samplerate, n_mels=cfg.n_mels)
-        # Normalize log-mel scale (~[-15, +5]) so the Conv2d front-end is
-        # numerically stable under fp16 autocast. Without this the first layer
-        # saturates and the model collapses to outputting CTC blank.
+        # Learnable channel-wise affine stacked on top of CMVN. CMVN alone
+        # zeroes the per-utt mean/var but cannot scale individual mel bins;
+        # the LayerNorm gives the front-end that extra degree of freedom.
         self.input_norm = nn.LayerNorm(cfg.n_mels)
         self.subsampling = ConvSubsampling(cfg.n_mels, cfg.subsampling_channels, cfg.d_model)
         self.input_drop = nn.Dropout(cfg.dropout)
@@ -161,9 +161,40 @@ class ConformerCTC(nn.Module):
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size)
         self.subsample_ratio = 4
 
-    def normalize_mel(self, mel: Tensor) -> Tensor:
-        # LayerNorm expects the normalized dim last. mel is (B, n_mels, T).
-        return self.input_norm(mel.transpose(1, 2)).transpose(1, 2)
+    def compute_mel_lens(self, lengths: Tensor, t_mel: int) -> Tensor:
+        # audio samples -> mel frames (center=True, pad): floor(N/hop)+1
+        mel_lens = torch.div(lengths, self.frontend.hop_length, rounding_mode="floor") + 1
+        return torch.clamp(mel_lens, max=t_mel)
+
+    def normalize_mel(self, mel: Tensor, mel_lens: Tensor | None = None) -> Tensor:
+        """Per-utterance CMVN (across time) then a learnable LayerNorm over mel bins.
+
+        CMVN removes speaker-level spectral tilt / DC offset — the single
+        largest numerical difference between an in-domain and an OOD voice.
+        Respecting mel_lens matters when the batch is padded: the padded
+        frames sit at log(1e-6) and would otherwise drag the mean down.
+
+        After normalization, padded frames are zeroed out. Without this,
+        the LN affine's beta bias leaks into the padded tail and the
+        stride-2 Conv2d subsampling bleeds that bias into the last
+        ~kernel/stride valid frames at each utterance end.
+        """
+        mask_time: Tensor | None = None
+        if mel_lens is None:
+            mean = mel.mean(dim=-1, keepdim=True)
+            var = mel.var(dim=-1, keepdim=True, unbiased=False)
+        else:
+            t = mel.size(-1)
+            mask_time = (torch.arange(t, device=mel.device)[None, :] < mel_lens[:, None]).unsqueeze(1).to(mel.dtype)
+            valid = mask_time.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            mean = (mel * mask_time).sum(dim=-1, keepdim=True) / valid
+            var = ((mel - mean) ** 2 * mask_time).sum(dim=-1, keepdim=True) / valid
+        std = torch.sqrt(var.clamp(min=1e-5))
+        mel = (mel - mean) / std
+        mel = self.input_norm(mel.transpose(1, 2)).transpose(1, 2)
+        if mask_time is not None:
+            mel = mel * mask_time
+        return mel
 
     def forward(self, waveform: Tensor, lengths: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """
@@ -175,17 +206,15 @@ class ConformerCTC(nn.Module):
             out_lens:  (B,) long, valid frame counts after subsampling.
         """
         mel = self.frontend(waveform)               # (B, n_mels, T_mel)
-        mel = self.normalize_mel(mel)
         t_mel = mel.size(-1)
+        mel_lens = self.compute_mel_lens(lengths, t_mel) if lengths is not None else None
+        mel = self.normalize_mel(mel, mel_lens)
         x = self.subsampling(mel)                   # (B, T', D)
         t_out = x.size(1)
         x = x + self.pe[:t_out].to(x.dtype)
         x = self.input_drop(x)
 
-        if lengths is not None:
-            # audio samples -> mel frames (center=True, pad): ceil(N/hop)+1
-            mel_lens = torch.div(lengths, self.frontend.hop_length, rounding_mode="floor") + 1
-            mel_lens = torch.clamp(mel_lens, max=t_mel)
+        if mel_lens is not None:
             # subsampling: each Conv2d stride-2 -> ceil(n/2)
             out_lens = ((mel_lens + 1) // 2 + 1) // 2
             out_lens = torch.clamp(out_lens, max=t_out)

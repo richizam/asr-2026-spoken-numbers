@@ -45,6 +45,45 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+class ModelEMA:
+    """Exponential moving average of model parameters.
+
+    Standard generalization trick: keep a shadow state dict, update on every
+    optimizer step with decay=0.999. Swap weights at validation and save the
+    shadow alongside the live weights so inference can prefer the smoother
+    EMA copy. Integer buffers (if any) are copied rather than averaged.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {
+            k: v.detach().clone() for k, v in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        for k, v in model.state_dict().items():
+            sh = self.shadow[k]
+            if v.dtype.is_floating_point:
+                sh.mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+            else:
+                sh.copy_(v.detach())
+
+    def apply_to(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
+        backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow, strict=True)
+        return backup
+
+    def restore(self, model: torch.nn.Module, backup: dict[str, torch.Tensor]) -> None:
+        model.load_state_dict(backup, strict=True)
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return dict(self.shadow)
+
+    def load_state_dict(self, sd: dict[str, torch.Tensor]) -> None:
+        self.shadow = {k: v.clone() for k, v in sd.items()}
+
+
 def linear_warmup_cosine(step: int, warmup: int, total: int, min_ratio: float = 0.01) -> float:
     if step < warmup:
         return step / max(1, warmup)
@@ -226,6 +265,13 @@ def train(config_path: str) -> None:
     )
     scaler = torch.amp.GradScaler(enabled=cfg["train"]["amp"])
 
+    ema_cfg = cfg["train"].get("ema", {}) or {}
+    ema = (
+        ModelEMA(model, decay=float(ema_cfg.get("decay", 0.999)))
+        if ema_cfg.get("enabled", True)
+        else None
+    )
+
     start_epoch = 0
     global_step = 0
     best_metric = float("inf")
@@ -246,6 +292,14 @@ def train(config_path: str) -> None:
         torch.set_rng_state(state["rng_cpu"])
         if torch.cuda.is_available() and state.get("rng_cuda") is not None:
             torch.cuda.set_rng_state_all(state["rng_cuda"])
+        if ema is not None:
+            if state.get("ema") is not None:
+                ema.load_state_dict(state["ema"])
+                print("[resume] restored EMA weights from checkpoint")
+            else:
+                # First run that introduces EMA — seed shadow from live weights.
+                ema = ModelEMA(model, decay=ema.decay)
+                print("[resume] no EMA in checkpoint; seeding shadow from live weights")
         print(
             f"[resume] epoch {start_epoch}, step {global_step}, "
             f"best_metric {best_metric:.4f}, best_cer {best_cer:.4f}"
@@ -269,7 +323,9 @@ def train(config_path: str) -> None:
                 # Forward, but intercept log-mel to apply SpecAugment before subsampling.
                 # Reimplement the body of ConformerCTC.forward() to allow feature aug.
                 mel = model.frontend(wav)
-                mel = model.normalize_mel(mel)
+                t_mel = mel.size(-1)
+                mel_lens = model.compute_mel_lens(wav_lens, t_mel)
+                mel = model.normalize_mel(mel, mel_lens)
                 mel = spec_augment(
                     mel,
                     num_freq_masks=cfg["train"]["specaug"]["num_freq_masks"],
@@ -281,8 +337,6 @@ def train(config_path: str) -> None:
                 t_out = x.size(1)
                 x = x + model.pe[:t_out].to(x.dtype)
                 x = model.input_drop(x)
-                mel_lens = torch.div(wav_lens, model.frontend.hop_length, rounding_mode="floor") + 1
-                mel_lens = torch.clamp(mel_lens, max=mel.size(-1))
                 out_lens = ((mel_lens + 1) // 2 + 1) // 2
                 out_lens = torch.clamp(out_lens, max=t_out)
                 mask = torch.arange(t_out, device=x.device)[None, :] >= out_lens[:, None]
@@ -308,6 +362,8 @@ def train(config_path: str) -> None:
                 scheduler.step()
                 opt.zero_grad(set_to_none=True)
                 global_step += 1
+                if ema is not None:
+                    ema.update(model)
 
             running_loss = 0.9 * running_loss + 0.1 * loss.item() * cfg["train"]["grad_accum"]
             running_unalign = 0.9 * running_unalign + 0.1 * unalignable
@@ -318,9 +374,15 @@ def train(config_path: str) -> None:
                     unalign=f"{running_unalign:.1f}",
                 )
 
-        # Validate
+        # Validate on EMA weights when available — they generalize better,
+        # so the hmean-CER curve based on them is a cleaner early-stop signal.
         if (epoch + 1) % cfg["train"]["val_every"] == 0:
-            metrics = validate(model, dev_loader, decoder, device, method=val_method)
+            backup = ema.apply_to(model) if ema is not None else None
+            try:
+                metrics = validate(model, dev_loader, decoder, device, method=val_method)
+            finally:
+                if backup is not None and ema is not None:
+                    ema.restore(model, backup)
             print(
                 f"[epoch {epoch}] dev CER = {metrics['cer']:.4f}  "
                 f"hmean CER = {metrics['hmean_cer']:.4f}  "
@@ -335,6 +397,7 @@ def train(config_path: str) -> None:
                 save_ckpt(
                     out_dir / "best.ckpt",
                     model=model.state_dict(),
+                    model_ema=ema.state_dict() if ema is not None else None,
                     cer=metrics["cer"],
                     hmean_cer=metrics["hmean_cer"],
                     epoch=epoch,
@@ -351,6 +414,7 @@ def train(config_path: str) -> None:
             opt=opt.state_dict(),
             sched=scheduler.state_dict(),
             scaler=scaler.state_dict(),
+            ema=ema.state_dict() if ema is not None else None,
             epoch=epoch,
             step=global_step,
             best_metric=best_metric,
