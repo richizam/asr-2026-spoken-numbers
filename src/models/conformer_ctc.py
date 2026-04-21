@@ -110,7 +110,9 @@ class ConvModule(nn.Module):
         self.dw = nn.Conv1d(
             d_model, d_model, kernel_size, padding=kernel_size // 2, groups=d_model
         )
-        self.bn = nn.BatchNorm1d(d_model)
+        # LayerNorm over the channel dim — no running stats, no train/eval gap
+        # under AMP + SpecAugment, unlike the original BatchNorm1d.
+        self.mid_norm = nn.LayerNorm(d_model)
         self.pw2 = nn.Conv1d(d_model, d_model, 1)
         self.drop = nn.Dropout(dropout)
 
@@ -119,7 +121,7 @@ class ConvModule(nn.Module):
         y = self.pw1(y)
         y = F.glu(y, dim=1)                       # (B, D, T)
         y = self.dw(y)
-        y = self.bn(y)
+        y = self.mid_norm(y.transpose(1, 2)).transpose(1, 2)
         y = F.silu(y)
         y = self.pw2(y)
         y = self.drop(y)
@@ -148,12 +150,20 @@ class ConformerCTC(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.frontend = LogMelFilterBanks(samplerate=cfg.samplerate, n_mels=cfg.n_mels)
+        # Normalize log-mel scale (~[-15, +5]) so the Conv2d front-end is
+        # numerically stable under fp16 autocast. Without this the first layer
+        # saturates and the model collapses to outputting CTC blank.
+        self.input_norm = nn.LayerNorm(cfg.n_mels)
         self.subsampling = ConvSubsampling(cfg.n_mels, cfg.subsampling_channels, cfg.d_model)
         self.input_drop = nn.Dropout(cfg.dropout)
         self.register_buffer("pe", _sinusoidal_pe(cfg.max_len, cfg.d_model), persistent=False)
         self.blocks = nn.ModuleList([ConformerBlock(cfg) for _ in range(cfg.num_layers)])
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size)
         self.subsample_ratio = 4
+
+    def normalize_mel(self, mel: Tensor) -> Tensor:
+        # LayerNorm expects the normalized dim last. mel is (B, n_mels, T).
+        return self.input_norm(mel.transpose(1, 2)).transpose(1, 2)
 
     def forward(self, waveform: Tensor, lengths: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """
@@ -165,6 +175,7 @@ class ConformerCTC(nn.Module):
             out_lens:  (B,) long, valid frame counts after subsampling.
         """
         mel = self.frontend(waveform)               # (B, n_mels, T_mel)
+        mel = self.normalize_mel(mel)
         t_mel = mel.size(-1)
         x = self.subsampling(mel)                   # (B, T', D)
         t_out = x.size(1)
@@ -187,7 +198,9 @@ class ConformerCTC(nn.Module):
             x = block(x, mask=mask)
 
         logits = self.head(x)                       # (B, T', V)
-        log_probs = F.log_softmax(logits, dim=-1)
+        # log_softmax in fp32 — under AMP the fp16 version can produce -inf
+        # and poison the CTC alignment grid via zero_infinity.
+        log_probs = F.log_softmax(logits.float(), dim=-1)
         return log_probs.transpose(0, 1), out_lens  # (T, B, V), (B,)
 
     def num_parameters(self) -> int:

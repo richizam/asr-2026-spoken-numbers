@@ -93,13 +93,20 @@ def validate(
     all_errs: list[float] = []
     empty_preds = 0
     pred_1000 = 0
+    blank_id = decoder.blank_id
+    # Token-argmax histogram across all dev frames, to catch blank-collapse.
+    argmax_hist = torch.zeros(decoder.vocab.__len__(), dtype=torch.long)
+    samples_shown: list[tuple[int, int, str]] = []
     for batch in tqdm(loader, desc="val", leave=False):
         wav = batch["wav"].to(device)
         wav_lens = batch["wav_lens"].to(device)
         log_probs, out_lens = model(wav, wav_lens)  # (T, B, V)
         log_probs = log_probs.transpose(0, 1)       # (B, T, V)
+        argmax = log_probs.argmax(dim=-1)           # (B, T)
         for b in range(log_probs.size(0)):
-            lp = log_probs[b, : int(out_lens[b].item())]
+            T_valid = int(out_lens[b].item())
+            lp = log_probs[b, :T_valid]
+            argmax_hist += torch.bincount(argmax[b, :T_valid].cpu(), minlength=argmax_hist.numel())
             raw_text = decoder.decode_text(lp.cpu(), method=method)
             hyp_int = decoder.snap.decode_to_int(raw_text)
             ref_int = batch["target_ints"][b]
@@ -109,6 +116,8 @@ def validate(
                 empty_preds += 1
             if hyp_int == 1000:
                 pred_1000 += 1
+            if len(samples_shown) < 3:
+                samples_shown.append((ref_int, hyp_int, raw_text[:80]))
             spk = batch["spk_ids"][b] or "unknown"
             per_spk_errs.setdefault(spk, []).append(err)
     mean_cer = float(np.mean(all_errs)) if all_errs else 1.0
@@ -121,12 +130,18 @@ def validate(
         hmean = 1.0
     model.train()
     n = max(1, len(all_errs))
+    total_frames = int(argmax_hist.sum().item()) or 1
+    blank_frac = float(argmax_hist[blank_id].item()) / total_frames
+    for ref_int, hyp_int, raw in samples_shown:
+        print(f"  sample: ref={ref_int} hyp={hyp_int} text={raw!r}")
+    print(f"  argmax blank_frac={blank_frac:.3f}  total_dev_frames={total_frames}")
     return {
         "cer": mean_cer,
         "per_spk": per_spk,
         "hmean_cer": hmean,
         "empty_pred_rate": empty_preds / n,
         "pred_1000_rate": pred_1000 / n,
+        "blank_frac": blank_frac,
     }
 
 
@@ -242,6 +257,7 @@ def train(config_path: str) -> None:
         model.train()
         opt.zero_grad(set_to_none=True)
         running_loss = 0.0
+        running_unalign = 0.0
         pbar = tqdm(train_loader, desc=f"epoch {epoch}")
         for it, batch in enumerate(pbar):
             wav = batch["wav"].to(device, non_blocking=True)
@@ -253,6 +269,7 @@ def train(config_path: str) -> None:
                 # Forward, but intercept log-mel to apply SpecAugment before subsampling.
                 # Reimplement the body of ConformerCTC.forward() to allow feature aug.
                 mel = model.frontend(wav)
+                mel = model.normalize_mel(mel)
                 mel = spec_augment(
                     mel,
                     num_freq_masks=cfg["train"]["specaug"]["num_freq_masks"],
@@ -272,8 +289,14 @@ def train(config_path: str) -> None:
                 for block in model.blocks:
                     x = block(x, mask=mask)
                 logits = model.head(x)
-                log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)  # (T, B, V)
-                loss = ctc(log_probs, targets, out_lens, target_lens) / cfg["train"]["grad_accum"]
+
+            # Compute CTC outside autocast in fp32. log_softmax in fp16 can
+            # yield -inf and zero_infinity=True then silently zeros the loss.
+            log_probs = F.log_softmax(logits.float(), dim=-1).transpose(0, 1)  # (T, B, V)
+            # Guard: any sample where out_lens < target_lens is unalignable and
+            # would be masked by zero_infinity, learning nothing. Count them.
+            unalignable = int((out_lens < target_lens).sum().item())
+            loss = ctc(log_probs, targets, out_lens, target_lens) / cfg["train"]["grad_accum"]
 
             scaler.scale(loss).backward()
 
@@ -287,8 +310,13 @@ def train(config_path: str) -> None:
                 global_step += 1
 
             running_loss = 0.9 * running_loss + 0.1 * loss.item() * cfg["train"]["grad_accum"]
+            running_unalign = 0.9 * running_unalign + 0.1 * unalignable
             if it % cfg["train"]["log_every"] == 0:
-                pbar.set_postfix(loss=f"{running_loss:.3f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
+                pbar.set_postfix(
+                    loss=f"{running_loss:.3f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                    unalign=f"{running_unalign:.1f}",
+                )
 
         # Validate
         if (epoch + 1) % cfg["train"]["val_every"] == 0:
