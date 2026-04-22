@@ -64,6 +64,9 @@ class ModelEMA:
     def update(self, model: torch.nn.Module) -> None:
         for k, v in model.state_dict().items():
             sh = self.shadow[k]
+            if sh.device != v.device:
+                sh = sh.to(v.device)
+                self.shadow[k] = sh
             if v.dtype.is_floating_point:
                 sh.mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
             else:
@@ -81,7 +84,13 @@ class ModelEMA:
         return dict(self.shadow)
 
     def load_state_dict(self, sd: dict[str, torch.Tensor]) -> None:
-        self.shadow = {k: v.clone() for k, v in sd.items()}
+        shadow: dict[str, torch.Tensor] = {}
+        for k, v in sd.items():
+            if k in self.shadow:
+                shadow[k] = v.detach().to(device=self.shadow[k].device, dtype=self.shadow[k].dtype).clone()
+            else:
+                shadow[k] = v.detach().clone()
+        self.shadow = shadow
 
 
 def linear_warmup_cosine(step: int, warmup: int, total: int, min_ratio: float = 0.01) -> float:
