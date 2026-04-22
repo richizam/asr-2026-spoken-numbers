@@ -74,3 +74,33 @@ def test_snap_recovers_with_noise() -> None:
     lp = torch.log_softmax(lp, dim=-1)
     dec = CTCBeamDecoder(vocab=vocab)
     assert dec.decode_to_int(lp, method="greedy") == 100000
+
+
+def test_trie_beam_recovers_valid_number() -> None:
+    """Trie-constrained beam should recover a clean number and reach a terminal node."""
+    vocab = CyrillicVocab()
+    target = 500_869
+    text = int_to_words(target)
+    lp = _make_one_hot_logprobs(vocab, text)
+    # Small trie range around the target so the test builds in <1 s.
+    dec = CTCBeamDecoder(vocab=vocab, beam_width=4, trie_range=(500_000, 500_999))
+    assert dec.beam_search_decode_trie(lp) == text
+    assert dec.decode_to_int(lp, method="beam_trie") == target
+
+
+def test_trie_beam_prunes_invalid_extensions() -> None:
+    """A decoded prefix that would leave the trie must not survive the beam.
+
+    Build log-probs that want to emit a non-Russian-number char ('ъ') in
+    the middle of what would otherwise be 'сто тысяч'. Plain beam decodes
+    include the 'ъ' garbage; the trie-constrained beam must reject it and
+    fall back to something still inside the trie.
+    """
+    vocab = CyrillicVocab()
+    clean = int_to_words(100_000)  # 'сто тысяч'
+    poisoned = clean[:3] + "ъ" + clean[3:]  # 'стоъ тысяч' — invalid prefix
+    lp = _make_one_hot_logprobs(vocab, poisoned)
+    dec = CTCBeamDecoder(vocab=vocab, beam_width=8, trie_range=(1_000, 100_999))
+    out = dec.beam_search_decode_trie(lp)
+    assert "ъ" not in out, f"trie failed to prune invalid char: {out!r}"
+    assert dec.decode_to_int(lp, method="beam_trie") == 100_000
