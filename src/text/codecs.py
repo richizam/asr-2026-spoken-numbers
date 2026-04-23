@@ -17,15 +17,15 @@ from .vocab import CyrillicVocab, TripletDigitVocab
 
 
 def int_to_triplet_text(n: int) -> str:
-    if not 1_000 <= n <= 999_999:
-        raise ValueError(f"triplet target expects n in [1000, 999999], got {n}")
+    if not 0 <= n <= 999_999:
+        raise ValueError(f"triplet target expects n in [0, 999999], got {n}")
     return f"{n // 1000:03d}|{n % 1000:03d}"
 
 
 class TripletSnapper:
     """Best-effort parser for fixed-width XYZ|ABC targets."""
 
-    def __init__(self, lo: int = 1_000, hi: int = 999_999) -> None:
+    def __init__(self, lo: int = 0, hi: int = 999_999) -> None:
         self.lo = lo
         self.hi = hi
 

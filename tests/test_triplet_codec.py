@@ -25,7 +25,7 @@ def _make_one_hot_logprobs(codec, text: str) -> torch.Tensor:
     return torch.log_softmax(lp, dim=-1)
 
 
-@pytest.mark.parametrize("n", [1000, 1005, 1021, 12345, 500869, 999999])
+@pytest.mark.parametrize("n", [394, 1000, 1005, 1021, 12345, 500869, 999999])
 def test_triplet_roundtrip(n: int) -> None:
     codec = build_number_codec("triplet_3x3")
     assert codec.decode_to_int(int_to_triplet_text(n)) == n
