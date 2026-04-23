@@ -49,6 +49,8 @@ class SpokenNumbersDataset(Dataset):
         self.target_sr = target_sr
         if number_codec is not None:
             self.codec = number_codec
+        elif getattr(vocab, "word_level", False):
+            self.codec = build_number_codec("word_tokens")
         elif getattr(vocab, "separator_id", None) is not None and getattr(vocab, "space_id", None) is None:
             self.codec = build_number_codec("triplet_3x3")
         else:

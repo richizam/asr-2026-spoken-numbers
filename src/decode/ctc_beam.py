@@ -50,22 +50,20 @@ class BeamHypothesis:
     log_prob: float
 
 
-class NumberCharTrie:
-    """Character-level prefix trie over num2words(n, 'ru') for n ∈ [lo, hi].
+class NumberTokenTrie:
+    """Token-level prefix trie over legal target sequences for n ∈ [lo, hi].
 
-    Each node is a plain ``dict`` mapping a single character to its child
-    node; terminal nodes additionally carry ``_TRIE_END`` so we can tell
-    in O(1) whether the current path is a complete legal transcription.
+    Each node is a plain ``dict`` mapping a token id to its child node;
+    terminal nodes additionally carry ``_TRIE_END`` so we can tell in O(1)
+    whether the current path is a complete legal transcription.
 
-    Build cost is dominated by ``num2words`` itself (~50 µs/call), so the
-    default range of 999k strings takes ~1 min on first instantiation.
     Construction is lazy from the decoder's point of view — only users
     that actually call the trie-constrained methods pay that cost.
     """
 
     def __init__(
         self,
-        text_fn: Callable[[int], str],
+        encode_int: Callable[[int], list[int]],
         lo: int = 1_000,
         hi: int = 999_999,
     ) -> None:
@@ -73,17 +71,17 @@ class NumberCharTrie:
         self.hi = hi
         self.root: dict = {}
         for n in range(lo, hi + 1):
-            s = text_fn(n)
+            s = encode_int(n)
             node = self.root
-            for c in s:
-                node = node.setdefault(c, {})
+            for tok in s:
+                node = node.setdefault(tok, {})
             node[_TRIE_END] = True
 
     @staticmethod
-    def step(node: dict | None, char: str) -> dict | None:
+    def step(node: dict | None, tok: int) -> dict | None:
         if node is None:
             return None
-        return node.get(char)
+        return node.get(tok)
 
     @staticmethod
     def is_terminal(node: dict | None) -> bool:
@@ -105,6 +103,8 @@ class CTCBeamDecoder:
     ) -> None:
         if codec is not None:
             self.codec = codec
+        elif getattr(vocab, "word_level", False):
+            self.codec = build_number_codec("word_tokens")
         elif getattr(vocab, "separator_id", None) is not None and getattr(vocab, "space_id", None) is None:
             self.codec = build_number_codec("triplet_3x3")
         else:
@@ -127,11 +127,11 @@ class CTCBeamDecoder:
         # Trie is built lazily on first call to a ``*_trie`` method so
         # existing callers of greedy / plain beam / beam_lm pay zero cost.
         self._trie_range = trie_range
-        self._number_trie: NumberCharTrie | None = None
+        self._number_trie: NumberTokenTrie | None = None
 
-    def _ensure_trie(self) -> NumberCharTrie:
+    def _ensure_trie(self) -> NumberTokenTrie:
         if self._number_trie is None:
-            self._number_trie = NumberCharTrie(self.codec.target_text, *self._trie_range)
+            self._number_trie = NumberTokenTrie(self.codec.encode_int, *self._trie_range)
         return self._number_trie
 
     # ------------------------------------------------------------------
@@ -260,8 +260,6 @@ class CTCBeamDecoder:
                     c_lp = float(lp[c].item())
                     if c_lp < -30:
                         continue
-                    char = self.vocab.id2tok[c]
-
                     if prefix and prefix[-1] == c:
                         # Repeat of last emitted char:
                         # (A) collapses into the existing prefix (no trie move).
@@ -275,7 +273,7 @@ class CTCBeamDecoder:
                         # blank just before — this *is* a new character
                         # in the decoded string, so it must take a trie
                         # step.
-                        new_node = node.get(char)
+                        new_node = node.get(c)
                         if new_node is None:
                             continue
                         new_prefix = prefix + (c,)
@@ -285,7 +283,7 @@ class CTCBeamDecoder:
                             next_beams[new_prefix] = entry
                         entry[1] = _log_add(entry[1], pb + c_lp)
                     else:
-                        new_node = node.get(char)
+                        new_node = node.get(c)
                         if new_node is None:
                             continue
                         new_prefix = prefix + (c,)
@@ -327,7 +325,7 @@ class CTCBeamDecoder:
                     + self.beta * _word_count(text)
                 )
             hyp = BeamHypothesis(ids=prefix, log_prob=total)
-            (terminal if NumberCharTrie.is_terminal(nd) else non_terminal).append(hyp)
+            (terminal if NumberTokenTrie.is_terminal(nd) else non_terminal).append(hyp)
         terminal.sort(key=lambda h: h.log_prob, reverse=True)
         non_terminal.sort(key=lambda h: h.log_prob, reverse=True)
         return terminal + non_terminal

@@ -3,6 +3,8 @@
 Two modes are supported:
 
 - ``words``: the original Russian ``num2words`` surface form.
+- ``word_tokens``: the same normalized Russian words, but emitted as a
+  sequence of whole-word CTC tokens rather than characters.
 - ``triplet_3x3``: a fixed-width ``XYZ|ABC`` digit string where the left
   triplet is the thousands group and the right triplet is the units group.
 """
@@ -13,7 +15,7 @@ from dataclasses import dataclass
 
 from .denormalizer import TrieSnapper
 from .normalizer import int_to_words
-from .vocab import CyrillicVocab, TripletDigitVocab
+from .vocab import CyrillicVocab, TripletDigitVocab, WordTokenVocab
 
 
 def int_to_triplet_text(n: int) -> str:
@@ -68,6 +70,22 @@ class WordsNumberCodec:
 
 
 @dataclass
+class WordTokenNumberCodec:
+    vocab: WordTokenVocab
+    snapper: TrieSnapper
+    mode: str = "word_tokens"
+
+    def target_text(self, n: int) -> str:
+        return int_to_words(n)
+
+    def encode_int(self, n: int) -> list[int]:
+        return self.vocab.encode(self.target_text(n))
+
+    def decode_to_int(self, text: str) -> int:
+        return self.snapper.decode_to_int(text)
+
+
+@dataclass
 class TripletNumberCodec:
     vocab: TripletDigitVocab
     snapper: TripletSnapper
@@ -86,6 +104,8 @@ class TripletNumberCodec:
 def build_number_codec(mode: str = "words"):
     if mode in ("words", "num2words", "russian_words"):
         return WordsNumberCodec(vocab=CyrillicVocab(), snapper=TrieSnapper())
+    if mode in ("word_tokens", "token_words", "normalized_word_tokens"):
+        return WordTokenNumberCodec(vocab=WordTokenVocab(), snapper=TrieSnapper())
     if mode in ("triplet", "triplet_3x3", "xyz_abc"):
         return TripletNumberCodec(vocab=TripletDigitVocab(), snapper=TripletSnapper())
     raise ValueError(f"unknown target mode: {mode}")
