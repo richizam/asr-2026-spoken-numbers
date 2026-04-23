@@ -66,7 +66,7 @@ class SpokenNumbersDataset(Dataset):
 
     def _load_audio(self, relpath: str) -> np.ndarray:
         if self.cache_dir is not None:
-            npy_path = self.cache_dir / (Path(relpath).stem + ".npy")
+            npy_path = self.cache_dir / Path(relpath).with_suffix(".npy")
             if npy_path.exists():
                 return np.load(npy_path)
         path = self.audio_root / relpath

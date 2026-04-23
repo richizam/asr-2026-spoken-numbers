@@ -269,14 +269,21 @@ def train(config_path: str) -> None:
         collate_fn=collate_fn,
         pin_memory=True,
         persistent_workers=cfg["train"]["num_workers"] > 0,
+        prefetch_factor=cfg["train"].get("prefetch_factor", 2) if cfg["train"]["num_workers"] > 0 else None,
     )
+    val_batch_size = cfg["train"].get("val_batch_size", cfg["train"]["batch_size"])
+    val_num_workers = cfg["train"].get("val_num_workers", cfg["train"]["num_workers"])
     dev_loader = DataLoader(
         dev_ds,
-        batch_size=cfg["train"]["batch_size"],
+        batch_size=val_batch_size,
         shuffle=False,
-        num_workers=cfg["train"]["num_workers"],
+        num_workers=val_num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
+        persistent_workers=val_num_workers > 0,
+        prefetch_factor=cfg["train"].get("val_prefetch_factor", cfg["train"].get("prefetch_factor", 2))
+        if val_num_workers > 0
+        else None,
     )
 
     model = build_model(cfg).to(device)
@@ -315,7 +322,7 @@ def train(config_path: str) -> None:
     global_step = 0
     best_metric = float("inf")
     best_cer = float("inf")
-    val_method = cfg["decode"].get("method", "beam_lm")
+    val_method = cfg["train"].get("val_decode_method", cfg["decode"].get("method", "beam_lm"))
 
     last_ckpt = out_dir / "last.ckpt"
     if last_ckpt.exists():
@@ -394,6 +401,13 @@ def train(config_path: str) -> None:
             # would be masked by zero_infinity, learning nothing. Count them.
             unalignable = int((out_lens < target_lens).sum().item())
             loss = ctc(log_probs, targets, out_lens, target_lens) / cfg["train"]["grad_accum"]
+            if not torch.isfinite(loss):
+                print(
+                    f"[warn] non-finite loss at epoch={epoch} iter={it} "
+                    f"lr={scheduler.get_last_lr()[0]:.2e}; skipping batch"
+                )
+                opt.zero_grad(set_to_none=True)
+                continue
 
             scaler.scale(loss).backward()
 
