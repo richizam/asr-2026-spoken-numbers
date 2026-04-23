@@ -21,12 +21,11 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import torch
 
-from ..text import CyrillicVocab
-from ..text.denormalizer import TrieSnapper
+from ..text import build_number_codec
 
 
 # Sentinel placed at terminal trie nodes. ``object()`` guarantees this key
@@ -64,13 +63,17 @@ class NumberCharTrie:
     that actually call the trie-constrained methods pay that cost.
     """
 
-    def __init__(self, lo: int = 1_000, hi: int = 999_999) -> None:
-        from ..text import int_to_words
+    def __init__(
+        self,
+        text_fn: Callable[[int], str],
+        lo: int = 1_000,
+        hi: int = 999_999,
+    ) -> None:
         self.lo = lo
         self.hi = hi
         self.root: dict = {}
         for n in range(lo, hi + 1):
-            s = int_to_words(n)
+            s = text_fn(n)
             node = self.root
             for c in s:
                 node = node.setdefault(c, {})
@@ -90,23 +93,30 @@ class NumberCharTrie:
 class CTCBeamDecoder:
     def __init__(
         self,
-        vocab: Optional[CyrillicVocab] = None,
+        vocab: Optional[Any] = None,
         beam_width: int = 16,
         alpha: float = 0.4,
         beta: float = 1.0,
         temperature: float = 1.0,
         lm_model_path: Optional[str] = None,
-        snap: Optional[TrieSnapper] = None,
+        snap: Optional[Any] = None,
+        codec: Optional[Any] = None,
         trie_range: tuple[int, int] = (1_000, 999_999),
     ) -> None:
-        self.vocab = vocab or CyrillicVocab()
+        if codec is not None:
+            self.codec = codec
+        elif getattr(vocab, "separator_id", None) is not None and getattr(vocab, "space_id", None) is None:
+            self.codec = build_number_codec("triplet_3x3")
+        else:
+            self.codec = build_number_codec("words")
+        self.vocab = vocab or self.codec.vocab
         self.blank_id = self.vocab.blank_id
-        self.space_id = self.vocab.space_id
+        self.space_id = getattr(self.vocab, "space_id", None)
         self.beam_width = beam_width
         self.alpha = alpha
         self.beta = beta
         self.temperature = temperature
-        self.snap = snap or TrieSnapper()
+        self.snap = snap or self.codec
         self.lm = None
         if lm_model_path is not None:
             try:
@@ -121,7 +131,7 @@ class CTCBeamDecoder:
 
     def _ensure_trie(self) -> NumberCharTrie:
         if self._number_trie is None:
-            self._number_trie = NumberCharTrie(*self._trie_range)
+            self._number_trie = NumberCharTrie(self.codec.target_text, *self._trie_range)
         return self._number_trie
 
     # ------------------------------------------------------------------

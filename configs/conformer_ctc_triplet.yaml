@@ -1,20 +1,20 @@
 seed: 42
-exp_name: conformer_ctc_small
+exp_name: conformer_ctc_triplet
 
 data:
   data_root: asr-2026-spoken-numbers-recognition-challenge
   train_csv: asr-2026-spoken-numbers-recognition-challenge/train.csv
   dev_csv:   asr-2026-spoken-numbers-recognition-challenge/dev.csv
   test_csv:  asr-2026-spoken-numbers-recognition-challenge/test.csv
-  target_mode: words
-  cache_root: cache_16k        # produced by scripts/prepare_data.py
+  target_mode: triplet_3x3
+  cache_root: cache_16k
   target_sr: 16000
   max_seconds: 6.0
-  noise_dir: ""                # populate with MUSAN path
-  rir_dir: ""                  # populate with RIR path
+  noise_dir: ""
+  rir_dir: ""
 
 model:
-  vocab_size: 35
+  vocab_size: 12
   n_mels: 80
   d_model: 128
   ffn_expansion: 2
@@ -35,7 +35,7 @@ train:
   grad_clip: 1.0
   amp: true
   log_every: 50
-  val_every: 1                 # epochs
+  val_every: 1
   specaug:
     num_freq_masks: 2
     freq_mask_param: 15
@@ -43,15 +43,15 @@ train:
     time_mask_param: 35
   ema:
     enabled: true
-    decay: 0.999               # shadow weights used for val + infer
+    decay: 0.999
 
 decode:
   beam_width: 16
   alpha: 0.4
   beta: 1.0
   temperature: 1.0
-  method: beam_lm              # greedy | beam | beam_lm | beam_lm_rescore
-  lm_path: ""                  # path to KenLM .arpa or .bin
+  method: beam_trie
+  lm_path: ""
 
 paths:
-  out_dir: runs/conformer_ctc_small
+  out_dir: runs/conformer_ctc_triplet

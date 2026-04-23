@@ -24,8 +24,7 @@ from tqdm import tqdm
 from .data.dataset import SpokenNumbersDataset, collate_fn
 from .decode.ctc_beam import CTCBeamDecoder
 from .models.conformer_ctc import ConformerCTC, ConformerCTCConfig
-from .text import CyrillicVocab
-from .text.denormalizer import TrieSnapper
+from .text import build_number_codec
 
 
 def load_model(ckpt_path: Path, cfg: dict, device: torch.device) -> ConformerCTC:
@@ -66,7 +65,9 @@ def run(
     with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    vocab = CyrillicVocab()
+    codec = build_number_codec(cfg["data"].get("target_mode", "words"))
+    vocab = codec.vocab
+    cfg["model"]["vocab_size"] = len(vocab)
 
     models = [load_model(Path(p), cfg, device) for p in ckpts]
     print(f"[infer] loaded {len(models)} model(s)")
@@ -78,13 +79,15 @@ def run(
         beta=cfg["decode"]["beta"],
         temperature=cfg["decode"]["temperature"],
         lm_model_path=cfg["decode"].get("lm_path") or None,
-        snap=TrieSnapper(),
+        snap=codec,
+        codec=codec,
     )
 
     ds = SpokenNumbersDataset(
         test_csv, data_root,
         target_sr=cfg["data"]["target_sr"],
         vocab=vocab,
+        number_codec=codec,
         augment=None,
         cache_dir=cache_root,
         max_seconds=cfg["data"]["max_seconds"],

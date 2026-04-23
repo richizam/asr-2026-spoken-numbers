@@ -34,8 +34,7 @@ from .data.dataset import SpokenNumbersDataset, collate_fn
 from .data.sampler import build_speaker_balanced_sampler
 from .decode.ctc_beam import CTCBeamDecoder
 from .models.conformer_ctc import ConformerCTC, ConformerCTCConfig
-from .text import CyrillicVocab, int_to_words
-from .text.denormalizer import TrieSnapper
+from .text import build_number_codec
 
 
 def set_seed(seed: int) -> None:
@@ -234,7 +233,9 @@ def train(config_path: str) -> None:
     out_dir = Path(cfg["paths"]["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    vocab = CyrillicVocab()
+    codec = build_number_codec(cfg["data"].get("target_mode", "words"))
+    vocab = codec.vocab
+    cfg["model"]["vocab_size"] = len(vocab)
     augment = build_train_augment(cfg["data"].get("noise_dir"), cfg["data"].get("rir_dir"))
 
     train_ds = SpokenNumbersDataset(
@@ -242,6 +243,7 @@ def train(config_path: str) -> None:
         cfg["data"]["data_root"],
         target_sr=cfg["data"]["target_sr"],
         vocab=vocab,
+        number_codec=codec,
         augment=augment,
         cache_dir=cfg["data"].get("cache_root"),
         max_seconds=cfg["data"]["max_seconds"],
@@ -251,6 +253,7 @@ def train(config_path: str) -> None:
         cfg["data"]["data_root"],
         target_sr=cfg["data"]["target_sr"],
         vocab=vocab,
+        number_codec=codec,
         augment=None,
         cache_dir=cfg["data"].get("cache_root"),
         max_seconds=cfg["data"]["max_seconds"],
@@ -288,7 +291,8 @@ def train(config_path: str) -> None:
         beta=cfg["decode"]["beta"],
         temperature=cfg["decode"]["temperature"],
         lm_model_path=cfg["decode"].get("lm_path") or None,
-        snap=TrieSnapper(),
+        snap=codec,
+        codec=codec,
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"],

@@ -1,16 +1,16 @@
 """CSV-driven dataset for train/dev/test splits.
 
 Audio is lazily loaded, resampled to ``target_sr`` (16 kHz), peak-normalized,
-and (for train/dev) converted to a CTC target using the char vocabulary and
-``num2words`` Russian normalizer. The dataset can optionally read from a
-pre-cached ``.npy`` shard directory produced by ``scripts/prepare_data.py``.
+and (for train/dev) converted to a CTC target using a configurable number
+representation. The dataset can optionally read from a pre-cached ``.npy``
+shard directory produced by ``scripts/prepare_data.py``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -18,7 +18,7 @@ import soundfile as sf
 import torch
 from torch.utils.data import Dataset
 
-from ..text import CyrillicVocab, int_to_words
+from ..text import build_number_codec
 
 
 @dataclass
@@ -37,7 +37,8 @@ class SpokenNumbersDataset(Dataset):
         csv_path: str | Path,
         audio_root: str | Path,
         target_sr: int = 16_000,
-        vocab: Optional[CyrillicVocab] = None,
+        vocab: Optional[Any] = None,
+        number_codec: Optional[Any] = None,
         augment: Optional[Callable[[np.ndarray, int], np.ndarray]] = None,
         cache_dir: Optional[str | Path] = None,
         max_seconds: float = 6.0,
@@ -46,7 +47,13 @@ class SpokenNumbersDataset(Dataset):
         self.df = pd.read_csv(csv_path)
         self.audio_root = Path(audio_root)
         self.target_sr = target_sr
-        self.vocab = vocab or CyrillicVocab()
+        if number_codec is not None:
+            self.codec = number_codec
+        elif getattr(vocab, "separator_id", None) is not None and getattr(vocab, "space_id", None) is None:
+            self.codec = build_number_codec("triplet_3x3")
+        else:
+            self.codec = build_number_codec("words")
+        self.vocab = vocab or self.codec.vocab
         self.augment = augment
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.max_samples = int(max_seconds * target_sr)
@@ -86,11 +93,11 @@ class SpokenNumbersDataset(Dataset):
         }
         if self.has_labels and "transcription" in row:
             n = int(row["transcription"])
-            words = int_to_words(n)
-            target_ids = self.vocab.encode(words)
+            target_text = self.codec.target_text(n)
+            target_ids = self.vocab.encode(target_text)
             item["target"] = torch.tensor(target_ids, dtype=torch.long)
             item["target_int"] = n
-            item["target_text"] = words
+            item["target_text"] = target_text
             if "spk_id" in row and isinstance(row["spk_id"], str):
                 item["spk_id"] = row["spk_id"]
         return item
